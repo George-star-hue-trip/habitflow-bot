@@ -112,7 +112,15 @@ bot.on('message', (ctx) => {
 // Планировщик проверяет привычки раз в минуту (выражение можно переопределить
 // через .env: REMINDER_CRON). Время сравниваем с ЛОКАЛЬНЫМ временем сервера,
 // а не с UTC, иначе напоминания придут со сдвигом часового пояса.
-const REMINDER_CRON_EXPR = process.env.REMINDER_CRON || '* * * * *';
+const REMINDER_CRON_RAW = process.env.REMINDER_CRON;
+// Защита от опечатки в переменной окружения: невалидное cron-выражение
+// уронило бы процесс на старте (node-cron валидирует его в конструкторе),
+// поэтому при ошибке молча откатываемся на '* * * * *'.
+const REMINDER_CRON_EXPR =
+  (REMINDER_CRON_RAW && cron.validate(REMINDER_CRON_RAW)) ? REMINDER_CRON_RAW : '* * * * *';
+if (REMINDER_CRON_RAW && REMINDER_CRON_EXPR !== REMINDER_CRON_RAW) {
+  console.error(`[Cron] Невалидное REMINDER_CRON="${REMINDER_CRON_RAW}" — использую '* * * * *'`);
+}
 
 async function checkReminders() {
   // Без ключей Supabase клиент не создан — проверять нечего.
@@ -202,30 +210,43 @@ async function checkReminders() {
   }
 }
 
-// Задача создаётся выключенной ({ scheduled: false }) и стартует в launch().then(),
-// чтобы к моменту первой проверки бот уже был готов отправлять сообщения.
+// ИСПРАВЛЕНИЕ: задача стартует СРАЗУ — без опции { scheduled: false }.
+// Раньше она стартовала внутри bot.launch().then(...), но launch() для long polling
+// резолвится ТОЛЬКО при остановке бота: telegraf делает `await this.startPolling()`,
+// а это бесконечный цикл getUpdates (node_modules/telegraf/lib/core/network/polling.js).
+// Из-за этого .then() не выполнялся никогда → планировщик не запускался.
 const reminderTask = cron.schedule(REMINDER_CRON_EXPR, () => {
   checkReminders().catch(e => console.error('[Cron] Ошибка:', e.message));
-}, { scheduled: false });
+});
+console.log(`[Cron] Планировщик напоминаний запущен (cron: ${REMINDER_CRON_EXPR})`);
+
+// Первая проверка сразу после старта — не ждём первую минуту
+setTimeout(() => {
+  checkReminders().catch(e => console.error('[Cron] Ошибка старта:', e.message));
+}, 3000);
 
 /* ------------------------------- Запуск ------------------------------- */
 
 log('Запуск HabitFlow-бота...');
 log('Mini App URL:', MINI_APP_URL);
 
+// Railway по умолчанию работает в UTC: если время в строках [Cron] Проверка
+// расходится с вашим часовым поясом — задайте переменную TZ (TZ=Europe/Moscow).
+log(`Часовой пояс процесса: ${Intl.DateTimeFormat().resolvedOptions().timeZone} ` +
+    `(смещение от UTC: ${-new Date().getTimezoneOffset()} мин)`);
+
 await checkSupabase();
+
+// launch() для long polling резолвится ТОЛЬКО при остановке бота
+// (см. пояснение у cron.schedule выше), поэтому логики «после старта»
+// в .then() быть не должно — планировщик напоминаний уже запущен выше.
+// Колбэк onLaunch у telegraf помечен как @experimental, поэтому не используем.
+log('Старт long polling (Ctrl+C для остановки)...');
 
 bot.launch()
   .then(() => {
-    log('Бот запущен и слушает обновления Telegram (Ctrl+C для остановки)');
-
-    // Планировщик стартует только после успешного launch(), чтобы
-    // sendMessage из checkReminders гарантированно работал.
-    reminderTask.start();
-    log(`[Cron] Планировщик напоминаний запущен (cron: ${REMINDER_CRON_EXPR}, проверка каждую минуту)`);
-
-    // Один раз при старте — чтобы не ждать первую минуту
-    checkReminders().catch(e => console.error('[Cron] Ошибка старта:', e.message));
+    // Сюда попадаем только когда бот остановлен (bot.stop по SIGINT/SIGTERM).
+    log('Long polling остановлен — бот больше не слушает Telegram');
   })
   .catch((e) => {
     logError('Не удалось запустить бота:', e.message || e);
